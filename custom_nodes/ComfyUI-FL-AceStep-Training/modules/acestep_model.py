@@ -145,7 +145,14 @@ def clone_model_for_training(model_patcher):
         Cloned ModelPatcher
     """
     training_model = model_patcher.clone(force_deepcopy=True)
-    training_model.model = copy.deepcopy(model_patcher.model)
+
+    # ComfyUI model configs intentionally return None for unknown attributes.
+    # Python's deepcopy probes __deepcopy__ and __setstate__ during cloning;
+    # sharing the immutable config prevents those probes from becoming calls
+    # to None while the model itself remains independent for training.
+    model_config = getattr(model_patcher.model, "model_config", None)
+    memo = {id(model_config): model_config} if model_config is not None else None
+    training_model.model = copy.deepcopy(model_patcher.model, memo)
     training_model.size = training_model.model_size()
     training_model.cached_patcher_init = None
     training_model.parent = None

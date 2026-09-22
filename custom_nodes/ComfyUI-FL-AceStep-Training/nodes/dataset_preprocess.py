@@ -14,6 +14,7 @@ Performance-optimized to match the sdbds reference implementation:
 
 import json
 import logging
+import math
 import random
 from pathlib import Path
 
@@ -131,6 +132,13 @@ class FL_AceStep_PreprocessDataset:
                     "max": 600.0,
                     "step": 10.0,
                 }),
+                "vae_chunk_seconds": ("FLOAT", {
+                    "default": 30.0,
+                    "min": 10.0,
+                    "max": 120.0,
+                    "step": 5.0,
+                    "label": "VAE chunk length (seconds)",
+                }),
                 "genre_ratio": ("INT", {
                     "default": 0,
                     "min": 0,
@@ -154,7 +162,8 @@ class FL_AceStep_PreprocessDataset:
         clip,
         output_dir,
         max_duration=240.0,
-        genre_ratio=0
+        vae_chunk_seconds=30.0,
+        genre_ratio=0,
     ):
         """Preprocess the dataset to tensor files."""
         samples = dataset.samples
@@ -183,84 +192,120 @@ class FL_AceStep_PreprocessDataset:
         if silence_latent is None:
             silence_latent = torch.zeros(1, 750, 64, device=device, dtype=enc_dtype)
 
-        # Progress bar
+        chunk_seconds = max(10.0, float(vae_chunk_seconds))
+        total_chunks = sum(
+            max(1, math.ceil(min(float(sample.duration), max_duration) / chunk_seconds))
+            for sample in labeled_samples
+        )
+
+        # Progress bar tracks source samples; logs report chunk progress.
         pbar = ProgressBar(len(labeled_samples)) if ProgressBar else None
 
         processed_count = 0
         manifest = []
         errors = []
 
-        logger.info(f"Preprocessing {len(labeled_samples)} samples to {output_dir}")
+        logger.info(
+            f"Preprocessing {len(labeled_samples)} samples as up to "
+            f"{total_chunks} {chunk_seconds:.0f}s chunks to {output_dir}"
+        )
 
         # --- Main loop: inference_mode for entire batch ---
         with torch.inference_mode():
             for i, sample in enumerate(labeled_samples):
+                source_duration = min(float(sample.duration), max_duration)
+                chunk_count = max(1, math.ceil(source_duration / chunk_seconds))
+                source_had_error = False
                 try:
-                    if model_management:
-                        model_management.load_models_gpu([vae.patcher], force_full_load=getattr(vae, 'disable_offload', False))
-                    else:
-                        vae_model.to(device)
-                    audio = load_audio(sample.audio_path, max_duration=max_duration)[0].unsqueeze(0).to(device=device, dtype=vae_dtype)
-                    target_latents = vae_encode_direct(vae_model, audio, device, vae_dtype)
-                    del audio
+                    for chunk_index in range(chunk_count):
+                        chunk_start = chunk_index * chunk_seconds
+                        chunk_duration = min(chunk_seconds, source_duration - chunk_start)
+                        if chunk_duration < 1.0:
+                            continue
 
-                    if model_management:
-                        model_management.load_models_gpu([clip.patcher])
-                        model_management.load_models_gpu([model])
-                    else:
-                        clip.cond_stage_model.to(device)
-                        condition_encoder.to(device)
+                        if model_management:
+                            model_management.load_models_gpu(
+                                [vae.patcher],
+                                force_full_load=getattr(vae, 'disable_offload', False),
+                            )
+                        else:
+                            vae_model.to(device)
 
-                    tensor_data = self._preprocess_sample(
-                        sample=sample,
-                        vae_model=vae_model,
-                        target_latents=target_latents,
-                        clip=clip,
-                        condition_encoder=condition_encoder,
-                        silence_latent=silence_latent,
-                        max_duration=max_duration,
-                        genre_ratio=genre_ratio,
-                        custom_tag=dataset.metadata.custom_tag,
-                        tag_position=dataset.metadata.tag_position,
-                        device=device,
-                        vae_dtype=vae_dtype,
-                        enc_dtype=enc_dtype,
-                    )
+                        audio = load_audio(
+                            sample.audio_path,
+                            max_duration=chunk_duration,
+                            start_seconds=chunk_start,
+                        )[0].unsqueeze(0).to(device=device, dtype=vae_dtype)
+                        target_latents = vae_encode_direct(
+                            vae_model,
+                            audio,
+                            device=device,
+                            dtype=vae_dtype,
+                        )
+                        del audio
 
-                    if tensor_data is None:
-                        continue
+                        if model_management:
+                            model_management.load_models_gpu([clip.patcher])
+                            model_management.load_models_gpu([model])
+                        else:
+                            clip.cond_stage_model.to(device)
+                            condition_encoder.to(device)
 
-                    # Save tensor file
-                    tensor_filename = f"{sample.id}.pt"
-                    tensor_path = output_path / tensor_filename
-                    torch.save(tensor_data, tensor_path)
+                        tensor_data = self._preprocess_sample(
+                            sample=sample,
+                            target_latents=target_latents,
+                            clip=clip,
+                            condition_encoder=condition_encoder,
+                            silence_latent=silence_latent,
+                            max_duration=max_duration,
+                            genre_ratio=genre_ratio,
+                            custom_tag=dataset.metadata.custom_tag,
+                            tag_position=dataset.metadata.tag_position,
+                            device=device,
+                            vae_dtype=vae_dtype,
+                            enc_dtype=enc_dtype,
+                            chunk_duration=chunk_duration,
+                        )
 
-                    manifest.append({
-                        "id": sample.id,
-                        "filename": tensor_filename,
-                        "audio_path": sample.audio_path,
-                        "caption": sample.caption,
-                        "duration": sample.duration,
-                        "bpm": sample.bpm,
-                        "keyscale": sample.keyscale,
-                        "is_instrumental": sample.is_instrumental,
-                    })
+                        if tensor_data is None:
+                            continue
 
-                    processed_count += 1
-                    logger.info(
-                        f"[{processed_count}/{len(labeled_samples)}] "
-                        f"{sample.filename} ({sample.duration:.0f}s)"
-                    )
+                        chunk_id = f"{sample.id}_chunk_{chunk_index:03d}"
+                        tensor_filename = f"{chunk_id}.pt"
+                        torch.save(tensor_data, output_path / tensor_filename)
+
+                        manifest.append({
+                            "id": chunk_id,
+                            "filename": tensor_filename,
+                            "audio_path": sample.audio_path,
+                            "caption": sample.caption,
+                            "duration": chunk_duration,
+                            "chunk_index": chunk_index,
+                            "chunk_start": chunk_start,
+                            "bpm": sample.bpm,
+                            "keyscale": sample.keyscale,
+                            "is_instrumental": sample.is_instrumental,
+                        })
+
+                        processed_count += 1
+                        logger.info(
+                            f"[{processed_count}/{total_chunks}] {sample.filename} "
+                            f"chunk {chunk_index + 1}/{chunk_count} "
+                            f"({chunk_start:.0f}-{chunk_start + chunk_duration:.0f}s)"
+                        )
+
+                        del target_latents, tensor_data
 
                 except Exception as e:
                     error_msg = f"Error processing sample {sample.id}: {str(e)}"
                     logger.warning(error_msg)
                     errors.append(error_msg)
+                    source_had_error = True
 
                 if pbar:
                     pbar.update(1)
 
-                if model_management:
+                if not source_had_error and model_management:
                     model_management.load_models_gpu([model])
 
                 # Periodic device cache clearing (every 8 samples)
@@ -278,12 +323,13 @@ class FL_AceStep_PreprocessDataset:
                 "metadata": {
                     "total_samples": processed_count,
                     "max_duration": max_duration,
+                    "vae_chunk_seconds": chunk_seconds,
                     "genre_ratio": genre_ratio,
                     "custom_tag": dataset.metadata.custom_tag,
                 }
             }, f, indent=2, ensure_ascii=False)
 
-        status = f"Preprocessed {processed_count}/{len(labeled_samples)} samples"
+        status = f"Preprocessed {processed_count} chunks from {len(labeled_samples)} samples"
         if errors:
             status += f" ({len(errors)} errors)"
 
@@ -293,7 +339,6 @@ class FL_AceStep_PreprocessDataset:
     def _preprocess_sample(
         self,
         sample,
-        vae_model,
         target_latents,
         clip,
         condition_encoder,
@@ -305,6 +350,7 @@ class FL_AceStep_PreprocessDataset:
         device,
         vae_dtype,
         enc_dtype,
+        chunk_duration=None,
     ):
         """Preprocess a single sample to tensor data."""
         # The audio has already been encoded before loading the text encoder.
@@ -330,7 +376,7 @@ class FL_AceStep_PreprocessDataset:
             f"- bpm: {sample.bpm if sample.bpm else 'N/A'}\n"
             f"- timesignature: {sample.timesignature if sample.timesignature else 'N/A'}\n"
             f"- keyscale: {sample.keyscale if sample.keyscale else 'N/A'}\n"
-            f"- duration: {int(sample.duration)} seconds\n"
+            f"- duration: {int(chunk_duration if chunk_duration is not None else sample.duration)} seconds\n"
         )
 
         text_prompt = SFT_GEN_PROMPT.format(
@@ -389,7 +435,7 @@ class FL_AceStep_PreprocessDataset:
                 "filename": sample.filename,
                 "caption": caption,
                 "lyrics": lyrics,
-                "duration": sample.duration,
+                "duration": chunk_duration if chunk_duration is not None else sample.duration,
                 "bpm": sample.bpm,
                 "keyscale": sample.keyscale,
                 "timesignature": sample.timesignature,

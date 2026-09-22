@@ -6,6 +6,7 @@ Uses native ComfyUI MODEL type for the ACE-Step model.
 """
 
 import logging
+from contextlib import contextmanager
 
 try:
     from comfy.utils import ProgressBar
@@ -22,10 +23,86 @@ from ..modules.audio_utils import audio_to_codes
 
 logger = logging.getLogger("FL_AceStep_Training")
 
+LANGUAGE_OPTIONS = [
+    "Auto",
+    "AA — Afar", "AB — Abkhazian", "AE — Avestan", "AK — Akan",
+    "AN — Aragonese", "AV — Avaric", "BA — Bashkir", "BH — Bihari",
+    "BI — Bislama", "BM — Bambara", "BO — Tibetan", "BR — Breton",
+    "CE — Chechen", "CH — Chamorro", "CR — Cree", "CU — Church Slavic",
+    "CV — Chuvash", "DV — Divehi", "DZ — Dzongkha", "FF — Fulah",
+    "FY — Western Frisian", "GV — Manx", "HO — Hiri Motu", "HZ — Herero",
+    "IA — Interlingua", "IE — Interlingue", "II — Sichuan Yi", "IK — Inupiaq",
+    "IO — Ido", "IU — Inuktitut", "KG — Kongo", "KI — Kikuyu",
+    "KJ — Kwanyama", "KL — Kalaallisut", "KR — Kanuri", "KS — Kashmiri",
+    "KV — Komi", "KW — Cornish", "LG — Ganda", "LN — Lingala",
+    "LU — Luba-Katanga", "MH — Marshallese", "NA — Nauru", "NB — Norwegian Bokmål",
+    "ND — North Ndebele", "NG — Ndonga", "NN — Norwegian Nynorsk", "NR — South Ndebele",
+    "NV — Navajo", "OC — Occitan", "OJ — Ojibwa", "OM — Oromo",
+    "OS — Ossetian", "PI — Pali", "RM — Romansh", "RN — Rundi",
+    "SC — Sardinian", "SE — Northern Sami", "SG — Sango", "SS — Swati",
+    "TL — Tagalog", "TN — Tswana", "TO — Tonga", "TW — Twi",
+    "TY — Tahitian", "VE — Venda", "VO — Volapük", "WA — Walloon",
+    "WO — Wolof", "ZA — Zhuang",
+    "AF — Afrikaans", "SQ — Albanian", "AM — Amharic", "AR — Arabic",
+    "HY — Armenian", "AS — Assamese", "AY — Aymara", "AZ — Azerbaijani",
+    "EU — Basque", "BE — Belarusian", "BN — Bengali", "BS — Bosnian",
+    "BG — Bulgarian", "CA — Catalan", "ZH — Chinese", "CO — Corsican",
+    "HR — Croatian", "CS — Czech", "DA — Danish", "NL — Dutch",
+    "EN — English", "EO — Esperanto", "ET — Estonian", "EE — Ewe",
+    "FO — Faroese", "FJ — Fijian", "FI — Finnish", "FR — French",
+    "GL — Galician", "KA — Georgian", "DE — German", "EL — Greek",
+    "GN — Guarani", "GU — Gujarati", "HT — Haitian Creole", "HA — Hausa",
+    "HE — Hebrew", "HI — Hindi", "HU — Hungarian", "IS — Icelandic",
+    "IG — Igbo", "ID — Indonesian", "GA — Irish", "IT — Italian",
+    "JA — Japanese", "JV — Javanese", "KN — Kannada", "KK — Kazakh",
+    "KM — Khmer", "RW — Kinyarwanda", "KO — Korean", "KU — Kurdish",
+    "KY — Kyrgyz", "LO — Lao", "LA — Latin", "LV — Latvian",
+    "LI — Limburgish", "LT — Lithuanian", "LB — Luxembourgish", "MK — Macedonian",
+    "MG — Malagasy", "MS — Malay", "ML — Malayalam", "MT — Maltese",
+    "MI — Maori", "MR — Marathi", "MN — Mongolian", "MY — Burmese",
+    "NE — Nepali", "NO — Norwegian", "NY — Nyanja", "OR — Odia",
+    "PS — Pashto", "FA — Persian", "PL — Polish", "PT — Portuguese",
+    "PA — Punjabi", "QU — Quechua", "RO — Romanian", "RU — Russian",
+    "SM — Samoan", "SA — Sanskrit", "GD — Scottish Gaelic", "SR — Serbian",
+    "ST — Sesotho", "SN — Shona", "SD — Sindhi", "SI — Sinhala",
+    "SK — Slovak", "SL — Slovenian", "SO — Somali", "ES — Spanish",
+    "SU — Sundanese", "SW — Swahili", "SV — Swedish", "TG — Tajik",
+    "TA — Tamil", "TT — Tatar", "TE — Telugu", "TH — Thai",
+    "TI — Tigrinya", "TS — Tsonga", "TR — Turkish", "TK — Turkmen",
+    "UK — Ukrainian", "UR — Urdu", "UG — Uyghur", "UZ — Uzbek",
+    "VI — Vietnamese", "CY — Welsh", "XH — Xhosa", "YI — Yiddish",
+    "YO — Yoruba", "ZU — Zulu",
+]
 
-def _build_lyrics_context(sample) -> str:
+
+@contextmanager
+def _llm_generation_device(llm, model, vae):
+    """Make room for a GPU-staged LLM, then restore ComfyUI's models."""
+    target_device = getattr(llm, "target_device", getattr(llm, "device", "cpu"))
+    if target_device != "xpu":
+        yield
+        return
+
+    logger.info("Preparing XPU for ACE-Step LLM labelling")
+    if model_management:
+        model_management.unload_model_and_clones(model, all_devices=True)
+        model_management.unload_model_and_clones(vae.patcher, all_devices=True)
+        model_management.soft_empty_cache(force=True)
+
+    llm.move_to_device("xpu")
+    try:
+        yield
+    finally:
+        llm.move_to_device("cpu")
+        if model_management:
+            model_management.soft_empty_cache(force=True)
+        logger.info("Restored ACE-Step LLM to CPU staging")
+
+
+def _build_lyrics_context(sample, language_hint="Auto", label_guidance="") -> str:
     variants = getattr(sample, "lyrics_variants", {})
-    if not variants and not sample.raw_lyrics:
+    guidance = (label_guidance or "").strip()
+    if not variants and not sample.raw_lyrics and language_hint == "Auto" and not guidance:
         return ""
 
     sections = [
@@ -35,6 +112,17 @@ def _build_lyrics_context(sample) -> str:
     ]
     if sample.custom_tag:
         sections.append(f"Dataset tag: {sample.custom_tag}")
+    if language_hint != "Auto":
+        language_code, language_name = language_hint.split(" — ", 1)
+        sections.append(
+            f"Declared song language: {language_name} (ISO 639-1: {language_code}). "
+            "Treat this language as authoritative when interpreting the lyrics and metadata."
+        )
+    if guidance:
+        sections.append(
+            "Label guidance:\n"
+            f"{guidance}"
+        )
     if variants.get("mk"):
         sections.append(f"Macedonian Cyrillic lyrics:\n{variants['mk']}")
     if variants.get("mktl"):
@@ -98,7 +186,17 @@ class FL_AceStep_LabelSamples:
                     "min": 1,
                     "max": 4,
                     "step": 1,
-                    "label": "CPU LLM batch size"
+                    "label": "LLM batch size"
+                }),
+                "language": (LANGUAGE_OPTIONS, {
+                    "default": "Auto",
+                    "label": "Language"
+                }),
+                "label_guidance": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "label": "Label guidance",
+                    "placeholder": "Optional cultural or dataset-specific labelling instructions",
                 }),
             }
         }
@@ -118,7 +216,9 @@ class FL_AceStep_LabelSamples:
         only_unlabeled=False,
         format_lyrics=False,
         transcribe_lyrics=False,
-        llm_batch_size=2
+        llm_batch_size=2,
+        language="Auto",
+        label_guidance="",
     ):
         """Label all samples in the dataset."""
         logger.info("Starting auto-labeling...")
@@ -155,55 +255,57 @@ class FL_AceStep_LabelSamples:
         errors = []
         batch_size = max(1, int(llm_batch_size))
         understand_batch = getattr(llm, "understand_audio_from_codes_batch", None)
+        metadata_by_index = {}
+        code_items = []
+        format_items = []
 
-        for batch_start in range(0, len(samples_to_label), batch_size):
-            batch = samples_to_label[batch_start:batch_start + batch_size]
-            metadata_by_index = {}
-            code_items = []
+        # Stage 1: keep the diffusion model and VAE on XPU while producing all
+        # audio codes. The LLM is not needed for this phase.
+        for idx, sample in samples_to_label:
+            if format_lyrics and sample.raw_lyrics:
+                format_items.append((idx, sample))
+                continue
 
-            for idx, sample in batch:
-                if format_lyrics and sample.raw_lyrics:
-                    try:
-                        logger.info(f"Formatting lyrics for sample {idx}: {sample.filename}")
-                        metadata_by_index[idx] = llm.format_sample(
-                            caption=sample.caption,
-                            lyrics=sample.raw_lyrics,
-                        )
-                    except Exception as e:
-                        logger.warning(f"Error formatting sample {idx}: {e}")
-                    continue
+            logger.info(f"Encoding audio to codes for sample {idx}: {sample.filename}")
+            try:
+                if model_management:
+                    model_management.load_models_gpu([vae.patcher])
+                    model_management.load_models_gpu([model])
+                dtype = next(tokenizer.parameters()).dtype
+                codes = audio_to_codes(
+                    vae=vae,
+                    tokenizer=tokenizer,
+                    audio_path=sample.audio_path,
+                    device=device,
+                    dtype=dtype,
+                    max_duration=30.0,
+                )
+            except Exception as e:
+                logger.warning(f"Audio encoding failed for sample {idx}: {e}")
+                codes = ""
 
-                logger.info(f"Encoding audio to codes for sample {idx}: {sample.filename}")
+            if codes:
+                logger.info(
+                    f"Generated {len(codes)} chars of audio codes for sample {idx}, "
+                    "queuing LLM..."
+                )
+                code_items.append((
+                    idx,
+                    codes,
+                    _build_lyrics_context(sample, language, label_guidance),
+                ))
+            else:
+                logger.warning(f"No audio codes for sample {idx}, skipping LLM labeling")
+
+        # Stages 2-4: release the heavy audio models, run the LLM on XPU, then
+        # return it to CPU staging so later training can reclaim XPU memory.
+        with _llm_generation_device(llm, model, vae):
+            total_batches = (len(code_items) + batch_size - 1) // batch_size
+            for batch_start in range(0, len(code_items), batch_size):
+                batch = code_items[batch_start:batch_start + batch_size]
                 try:
-                    if model_management:
-                        model_management.load_models_gpu([vae.patcher])
-                        model_management.load_models_gpu([model])
-                    dtype = next(tokenizer.parameters()).dtype
-                    codes = audio_to_codes(
-                        vae=vae,
-                        tokenizer=tokenizer,
-                        audio_path=sample.audio_path,
-                        device=device,
-                        dtype=dtype,
-                        max_duration=30.0,
-                    )
-                except Exception as e:
-                    logger.warning(f"Audio encoding failed for sample {idx}: {e}")
-                    codes = ""
-
-                if codes:
-                    logger.info(
-                        f"Generated {len(codes)} chars of audio codes for sample {idx}, "
-                        "queuing LLM..."
-                    )
-                    code_items.append((idx, codes, _build_lyrics_context(sample)))
-                else:
-                    logger.warning(f"No audio codes for sample {idx}, skipping LLM labeling")
-
-            if code_items:
-                try:
-                    codes = [item[1] for item in code_items]
-                    lyrics_contexts = [item[2] for item in code_items]
+                    codes = [item[1] for item in batch]
+                    lyrics_contexts = [item[2] for item in batch]
                     if understand_batch is not None:
                         metadata = understand_batch(codes, lyrics_contexts)
                     else:
@@ -211,57 +313,81 @@ class FL_AceStep_LabelSamples:
                             llm.understand_audio_from_codes(code, lyrics_context=context)
                             for code, context in zip(codes, lyrics_contexts)
                         ]
-                    for (idx, _, _), item_metadata in zip(code_items, metadata):
+                    for (idx, _, _), item_metadata in zip(batch, metadata):
                         metadata_by_index[idx] = item_metadata
-                except Exception as e:
-                    logger.warning(f"Batched LLM generation failed: {e}")
-
-            for idx, sample in batch:
-                metadata = metadata_by_index.get(idx)
-                if metadata is None:
-                    errors.append(f"Sample {idx}: no metadata generated")
-                    if pbar:
-                        pbar.update(1)
-                    continue
-
-                try:
-                    if metadata.get("caption"):
-                        sample.caption = metadata["caption"]
-                    if metadata.get("genre"):
-                        sample.genre = metadata["genre"]
-
-                    if not skip_metas:
-                        if metadata.get("bpm") and sample.bpm is None:
-                            sample.bpm = metadata["bpm"]
-                        if metadata.get("keyscale") and not sample.keyscale:
-                            sample.keyscale = metadata["keyscale"]
-                        if metadata.get("timesignature"):
-                            sample.timesignature = metadata["timesignature"]
-
-                    if metadata.get("language"):
-                        sample.language = metadata["language"]
-                        sample.is_instrumental = metadata["language"].lower() == "instrumental"
-
-                    if metadata.get("lyrics") and metadata["lyrics"] != "[Instrumental]":
-                        if transcribe_lyrics or format_lyrics:
-                            sample.lyrics = metadata["lyrics"]
-                            sample.formatted_lyrics = metadata["lyrics"]
-                            sample.is_instrumental = False
-
-                    sample.labeled = True
-                    labeled_count += 1
-
                     logger.info(
-                        f"Sample {idx} labeled: caption='{sample.caption[:60]}...', "
-                        f"bpm={sample.bpm}, key={sample.keyscale}"
+                        "LLM labelling batch %d/%d complete",
+                        batch_start // batch_size + 1,
+                        total_batches,
                     )
                 except Exception as e:
-                    error_msg = f"Error labeling sample {idx}: {str(e)}"
-                    logger.warning(error_msg)
-                    errors.append(error_msg)
+                    logger.warning(
+                        "LLM labelling batch %d/%d failed: %s",
+                        batch_start // batch_size + 1,
+                        total_batches,
+                        e,
+                    )
 
+            for idx, sample in format_items:
+                try:
+                    logger.info(f"Formatting lyrics for sample {idx}: {sample.filename}")
+                    metadata_by_index[idx] = llm.format_sample(
+                        caption=sample.caption,
+                        lyrics=sample.raw_lyrics,
+                        instruction_context=_build_lyrics_context(
+                            sample, language, label_guidance
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(f"Error formatting sample {idx}: {e}")
+
+        # Apply generated metadata in the original dataset order.
+        for idx, sample in samples_to_label:
+            metadata = metadata_by_index.get(idx)
+            if metadata is None:
+                errors.append(f"Sample {idx}: no metadata generated")
                 if pbar:
                     pbar.update(1)
+                continue
+
+            try:
+                if metadata.get("caption"):
+                    sample.caption = metadata["caption"]
+                if metadata.get("genre"):
+                    sample.genre = metadata["genre"]
+
+                if not skip_metas:
+                    if metadata.get("bpm") and sample.bpm is None:
+                        sample.bpm = metadata["bpm"]
+                    if metadata.get("keyscale") and not sample.keyscale:
+                        sample.keyscale = metadata["keyscale"]
+                    if metadata.get("timesignature"):
+                        sample.timesignature = metadata["timesignature"]
+
+                if metadata.get("language"):
+                    sample.language = metadata["language"]
+                    sample.is_instrumental = metadata["language"].lower() == "instrumental"
+
+                if metadata.get("lyrics") and metadata["lyrics"] != "[Instrumental]":
+                    if transcribe_lyrics or format_lyrics:
+                        sample.lyrics = metadata["lyrics"]
+                        sample.formatted_lyrics = metadata["lyrics"]
+                        sample.is_instrumental = False
+
+                sample.labeled = True
+                labeled_count += 1
+
+                logger.info(
+                    f"Sample {idx} labeled: caption='{sample.caption[:60]}...', "
+                    f"bpm={sample.bpm}, key={sample.keyscale}"
+                )
+            except Exception as e:
+                error_msg = f"Error labeling sample {idx}: {str(e)}"
+                logger.warning(error_msg)
+                errors.append(error_msg)
+
+            if pbar:
+                pbar.update(1)
 
         # Build status message
         status = f"Labeled {labeled_count}/{len(samples_to_label)} samples"

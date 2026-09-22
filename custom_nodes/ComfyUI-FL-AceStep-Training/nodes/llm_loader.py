@@ -30,7 +30,7 @@ LLM_MODELS = [
     "acestep-5Hz-lm-4B",
 ]
 
-DEVICE_OPTIONS = ["auto", "cuda", "cpu"]
+DEVICE_OPTIONS = ["auto", "xpu", "cuda", "cpu"]
 BACKEND_OPTIONS = ["pt", "vllm"]
 
 # System instructions matching the official ACE-Step 5Hz-lm training format
@@ -57,12 +57,20 @@ class ACEStepLLMHandler:
     Uses ChatML prompt format matching the official ACE-Step training.
     """
 
-    def __init__(self, model, tokenizer, device, dtype, model_name):
+    def __init__(self, model, tokenizer, device, dtype, model_name, target_device=None):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
+        self.target_device = target_device or device
         self.dtype = dtype
         self.model_name = model_name
+
+    def move_to_device(self, device):
+        """Move a CPU-staged model to its generation device."""
+        if self.device == device:
+            return
+        self.model = self.model.to(device)
+        self.device = device
 
     def understand_audio_from_codes(
         self,
@@ -71,7 +79,7 @@ class ACEStepLLMHandler:
         temperature: float = 0.3,
         top_k: int = 50,
         top_p: float = 0.95,
-        max_new_tokens: int = 2048,
+        max_new_tokens: int = 768,
     ):
         """
         Generate metadata and lyrics from audio codes.
@@ -104,7 +112,7 @@ class ACEStepLLMHandler:
         temperature: float = 0.3,
         top_k: int = 50,
         top_p: float = 0.95,
-        max_new_tokens: int = 2048,
+        max_new_tokens: int = 768,
     ) -> list[dict]:
         """Generate metadata for several audio-code prompts in one batch."""
         if lyrics_contexts is None:
@@ -127,8 +135,9 @@ class ACEStepLLMHandler:
         caption: str,
         lyrics: str,
         user_metadata: dict = None,
+        instruction_context: str = "",
         temperature: float = 0.85,
-        max_new_tokens: int = 2048,
+        max_new_tokens: int = 768,
     ):
         """
         Format user-provided caption and lyrics into structured metadata.
@@ -143,7 +152,7 @@ class ACEStepLLMHandler:
         Returns:
             Dictionary with formatted metadata
         """
-        messages = self._build_formatting_messages(caption, lyrics)
+        messages = self._build_formatting_messages(caption, lyrics, instruction_context)
         response = self._generate(
             messages,
             temperature=temperature,
@@ -162,11 +171,18 @@ class ACEStepLLMHandler:
             {"role": "user", "content": user_content},
         ]
 
-    def _build_formatting_messages(self, caption: str, lyrics: str) -> list:
+    def _build_formatting_messages(
+        self,
+        caption: str,
+        lyrics: str,
+        instruction_context: str = "",
+    ) -> list:
         """Build ChatML messages for sample formatting."""
         caption = caption or "NO USER INPUT"
         lyrics = lyrics or "[Instrumental]"
         user_content = f"# Caption\n{caption}\n\n# Lyric\n{lyrics}"
+        if instruction_context:
+            user_content = f"{user_content}\n\n{instruction_context}"
         return [
             {"role": "system", "content": FORMAT_INSTRUCTION},
             {"role": "user", "content": user_content},
@@ -178,7 +194,7 @@ class ACEStepLLMHandler:
         temperature: float = 0.7,
         top_k: int = 50,
         top_p: float = 0.95,
-        max_new_tokens: int = 2048,
+        max_new_tokens: int = 768,
     ) -> str:
         """
         Generate response from LLM using ChatML prompt format.
@@ -229,7 +245,7 @@ class ACEStepLLMHandler:
         temperature: float = 0.7,
         top_k: int = 50,
         top_p: float = 0.95,
-        max_new_tokens: int = 2048,
+        max_new_tokens: int = 768,
     ) -> list[str]:
         """Generate responses for a batch while reusing the loaded model."""
         prompts = [
@@ -490,7 +506,15 @@ class FL_AceStep_LLMLoader:
 
         # Determine device
         if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if hasattr(torch, "xpu") and torch.xpu.is_available():
+                device = "xpu"
+            elif torch.cuda.is_available():
+                device = "cuda"
+            else:
+                device = "cpu"
+
+        requested_device = device
+        load_device = "cpu" if device == "xpu" else device
 
         # Step 2: Load the LLM
         if pbar:
@@ -508,7 +532,7 @@ class FL_AceStep_LLMLoader:
             tokenizer = AutoTokenizer.from_pretrained(lm_path)
 
             # Determine dtype based on device
-            if device == "cuda":
+            if device in ("cuda", "xpu"):
                 torch_dtype = torch.bfloat16
             else:
                 torch_dtype = torch.float32
@@ -529,10 +553,12 @@ class FL_AceStep_LLMLoader:
                 model = AutoModelForCausalLM.from_pretrained(
                     lm_path,
                     torch_dtype=torch_dtype,
-                    device_map=device if device != "cpu" else None,
+                    device_map=load_device if load_device == "cuda" else None,
                 )
-                if device == "cpu":
-                    model = model.to(device)
+                if load_device == "cpu":
+                    model = model.to("cpu")
+                elif load_device != "cuda":
+                    model = model.to(load_device)
                 model.eval()
 
         except Exception as e:
@@ -543,9 +569,10 @@ class FL_AceStep_LLMLoader:
         handler = ACEStepLLMHandler(
             model=model,
             tokenizer=tokenizer,
-            device=device,
+            device=load_device,
             dtype=torch_dtype if backend == "pt" else None,
             model_name=model_name,
+            target_device=requested_device,
         )
 
         logger.info(f"LLM '{model_name}' loaded successfully")

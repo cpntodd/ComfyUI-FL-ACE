@@ -28,13 +28,18 @@ MIN_SAMPLES = SAMPLE_RATE  # 1 second minimum
 _RESAMPLER_CACHE: dict = {}
 
 
-def load_audio(audio_path: str, max_duration: float = None) -> Tuple[torch.Tensor, int]:
+def load_audio(
+    audio_path: str,
+    max_duration: float = None,
+    start_seconds: float = 0.0,
+) -> Tuple[torch.Tensor, int]:
     """
     Load an audio file, resample to 48kHz stereo.
 
     Args:
         audio_path: Path to audio file
         max_duration: Optional max duration in seconds to truncate to
+        start_seconds: Optional start offset in seconds
 
     Returns:
         Tuple of (waveform [C, T], sample_rate)
@@ -56,12 +61,13 @@ def load_audio(audio_path: str, max_duration: float = None) -> Tuple[torch.Tenso
             _RESAMPLER_CACHE[cache_key] = torchaudio.transforms.Resample(sr, SAMPLE_RATE)
         waveform = _RESAMPLER_CACHE[cache_key](waveform)
 
-    # Validate minimum duration
-    if waveform.shape[-1] < MIN_SAMPLES:
+    start_samples = max(0, int(start_seconds * SAMPLE_RATE))
+    if start_samples >= waveform.shape[-1]:
         raise ValueError(
-            f"Audio too short: {waveform.shape[-1]} samples "
-            f"({waveform.shape[-1] / SAMPLE_RATE:.2f}s). Minimum is 1 second."
+            f"Audio offset is outside the file: {start_seconds:.2f}s"
         )
+
+    waveform = waveform[:, start_samples:]
 
     # Convert to stereo
     if waveform.shape[0] == 1:
@@ -74,6 +80,12 @@ def load_audio(audio_path: str, max_duration: float = None) -> Tuple[torch.Tenso
         max_samples = int(max_duration * SAMPLE_RATE)
         if waveform.shape[-1] > max_samples:
             waveform = waveform[:, :max_samples]
+
+    if waveform.shape[-1] < MIN_SAMPLES:
+        raise ValueError(
+            f"Audio segment too short: {waveform.shape[-1]} samples "
+            f"({waveform.shape[-1] / SAMPLE_RATE:.2f}s). Minimum is 1 second."
+        )
 
     return waveform, SAMPLE_RATE
 
@@ -126,6 +138,26 @@ def vae_encode_direct(vae_model, audio_tensor: torch.Tensor, device, dtype) -> t
     audio_in = audio_tensor.to(device=device, dtype=dtype)
     latents = vae_model.encode(audio_in)  # [B, 64, T_latent]
     return latents.transpose(1, 2).float()  # [B, T_latent, 64]
+
+
+def vae_encode_tiled(
+    vae,
+    audio_tensor: torch.Tensor,
+    chunk_seconds: float = 30.0,
+    overlap_seconds: float = 2.0,
+) -> torch.Tensor:
+    """Encode long audio through ComfyUI's memory-bounded 1D VAE path."""
+    audio_for_vae = audio_tensor.movedim(1, -1)  # [B, C, T] -> [B, T, C]
+    tile_samples = max(1, int(chunk_seconds * SAMPLE_RATE))
+    overlap_samples = max(0, min(tile_samples // 2, int(overlap_seconds * SAMPLE_RATE)))
+    # AceStep uses a 1D audio VAE. Calling the dedicated helper avoids the
+    # generic encode_tiled wrapper's spatial tile_y handling.
+    latents = vae.encode_tiled_1d(
+        audio_for_vae.movedim(-1, 1),
+        tile_x=tile_samples,
+        overlap=overlap_samples,
+    )
+    return latents.transpose(1, 2)
 
 
 def audio_to_codes(
